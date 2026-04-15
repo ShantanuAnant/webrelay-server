@@ -11,11 +11,11 @@ Supports:
 import asyncio
 import json
 import logging
+import os
 import uuid
 from collections import defaultdict, deque
-from urllib.parse import urlparse
 
-import websockets
+from aiohttp import web, WSMsgType
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -52,68 +52,72 @@ class RelayServer:
         
     async def handle_workshop(self, websocket):
         """Handle workshop (server) connection"""
-        logger.info(f"Workshop connected from {websocket.remote_address}")
+        logger.info("Workshop connected")
         self.workshop_connection = websocket
         
         try:
-            async for message in websocket:
+            async for msg in websocket:
+                if msg.type != WSMsgType.TEXT:
+                    continue
+                message = msg.data
                 # Workshop sends acknowledgments back to lab
                 for lab_conn in list(self.lab_connections):
                     try:
-                        await lab_conn.send(message)
+                        await lab_conn.send_str(message)
                         logger.debug(f"Forwarded ack from workshop to lab")
                     except Exception as e:
                         logger.error(f"Error sending to lab: {e}")
                         if lab_conn in self.lab_connections:
                             self.lab_connections.remove(lab_conn)
-        except websockets.exceptions.ConnectionClosed:
-            logger.info("Workshop disconnected")
         except Exception as e:
             logger.error(f"Error in handle_workshop: {e}", exc_info=True)
         finally:
+            logger.info("Workshop disconnected")
             if self.workshop_connection is websocket:
                 self.workshop_connection = None
     
     async def handle_lab(self, websocket):
         """Handle lab (client) connection"""
-        logger.info(f"Lab connected from {websocket.remote_address}")
+        logger.info("Lab connected")
         self.lab_connections.add(websocket)
         
         try:
-            async for message in websocket:
+            async for msg in websocket:
+                if msg.type != WSMsgType.TEXT:
+                    continue
+                message = msg.data
                 # Forward control data from lab to workshop
                 if self.workshop_connection:
                     try:
-                        await self.workshop_connection.send(message)
+                        await self.workshop_connection.send_str(message)
                         logger.debug(f"Forwarded message from lab to workshop")
                     except Exception as e:
                         logger.error(f"Error forwarding to workshop: {e}")
                         try:
-                            await websocket.send(json.dumps({
+                            await websocket.send_json({
                                 'status': 'error',
                                 'message': 'Workshop not connected'
-                            }))
+                            })
                         except:
                             pass
                 else:
                     logger.warning("No workshop connected, sending error to lab")
                     try:
-                        await websocket.send(json.dumps({
+                        await websocket.send_json({
                             'status': 'error',
                             'message': 'Workshop not connected'
-                        }))
+                        })
                     except:
                         pass
-        except websockets.exceptions.ConnectionClosed:
-            logger.info("Lab disconnected")
         except Exception as e:
             logger.error(f"Error in handle_lab: {e}", exc_info=True)
         finally:
+            logger.info("Lab disconnected")
             if websocket in self.lab_connections:
                 self.lab_connections.remove(websocket)
 
     async def send_json(self, websocket, payload):
-        await websocket.send(json.dumps(payload))
+        await websocket.send_json(payload)
 
     async def send_error(self, websocket, message, code="error"):
         await self.send_json(
@@ -322,14 +326,19 @@ class RelayServer:
     async def handle_protocol_connection(self, websocket):
         """Handle protocol demo clients on /protocol."""
         try:
-            hello_raw = await asyncio.wait_for(websocket.recv(), timeout=15)
+            hello_msg = await asyncio.wait_for(websocket.receive(), timeout=15)
         except asyncio.TimeoutError:
             await self.send_error(websocket, "Expected hello message within 15 seconds", "hello_timeout")
             await websocket.close()
             return
 
+        if hello_msg.type != WSMsgType.TEXT:
+            await self.send_error(websocket, "First message must be JSON hello payload", "bad_hello")
+            await websocket.close()
+            return
+
         try:
-            hello = json.loads(hello_raw)
+            hello = json.loads(hello_msg.data)
         except json.JSONDecodeError:
             await self.send_error(websocket, "First message must be JSON hello payload", "bad_hello")
             await websocket.close()
@@ -346,9 +355,11 @@ class RelayServer:
             return
 
         try:
-            async for raw_message in websocket:
+            async for msg in websocket:
+                if msg.type != WSMsgType.TEXT:
+                    continue
                 try:
-                    data = json.loads(raw_message)
+                    data = json.loads(msg.data)
                 except json.JSONDecodeError:
                     await self.send_error(websocket, "Message must be valid JSON", "bad_json")
                     continue
@@ -360,11 +371,10 @@ class RelayServer:
                     await self.handle_request_response_message(websocket, data, session)
                 elif protocol == "exclusive_pair":
                     await self.handle_exclusive_pair_message(websocket, data, session)
-        except websockets.exceptions.ConnectionClosed:
-            logger.info("Protocol client disconnected: %s", session["client_id"])
         except Exception as e:
             logger.error("Protocol connection error: %s", e, exc_info=True)
         finally:
+            logger.info("Protocol client disconnected: %s", session["client_id"])
             await self.cleanup_protocol_session(websocket)
 
     async def cleanup_protocol_session(self, websocket):
@@ -409,32 +419,58 @@ class RelayServer:
                 except Exception:
                     pass
     
-    async def handle_connection(self, websocket):
-        """Route connections based on path"""
-        path = urlparse(websocket.request.path).path
-        if path == "/workshop":
-            await self.handle_workshop(websocket)
-        elif path == "/lab":
-            await self.handle_lab(websocket)
-        elif path == "/protocol":
-            await self.handle_protocol_connection(websocket)
-        else:
-            logger.warning(f"Unknown path: {path}")
-            await websocket.close()
+    async def workshop_ws_handler(self, request):
+        websocket = web.WebSocketResponse(heartbeat=20)
+        await websocket.prepare(request)
+        await self.handle_workshop(websocket)
+        return websocket
+
+    async def lab_ws_handler(self, request):
+        websocket = web.WebSocketResponse(heartbeat=20)
+        await websocket.prepare(request)
+        await self.handle_lab(websocket)
+        return websocket
+
+    async def protocol_ws_handler(self, request):
+        websocket = web.WebSocketResponse(heartbeat=20)
+        await websocket.prepare(request)
+        await self.handle_protocol_connection(websocket)
+        return websocket
+
+    async def root_handler(self, request):
+        return web.Response(
+            text=(
+                "Relay server is running. Use WebSocket endpoints: "
+                "/workshop, /lab, /protocol"
+            )
+        )
+
+    async def health_handler(self, request):
+        return web.json_response({"status": "ok", "service": "relay"})
     
     async def start(self, host="0.0.0.0", port=None):
         """Start the relay server"""
         if port is None:
-            import os
             port = int(os.environ.get("PORT", 8080))
         
         logger.info(f"Starting relay server on {host}:{port}")
         logger.info("Workshop should connect to: ws://YOUR_DOMAIN/workshop")
         logger.info("Lab should connect to: ws://YOUR_DOMAIN/lab")
         logger.info("Protocol demo clients should connect to: ws://YOUR_DOMAIN/protocol")
-        
-        async with websockets.serve(self.handle_connection, host, port):
-            await asyncio.Future()  # Run forever
+
+        app = web.Application()
+        app.router.add_get("/", self.root_handler)
+        app.router.add_get("/health", self.health_handler)
+        app.router.add_get("/workshop", self.workshop_ws_handler)
+        app.router.add_get("/lab", self.lab_ws_handler)
+        app.router.add_get("/protocol", self.protocol_ws_handler)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, host=host, port=port)
+        await site.start()
+
+        await asyncio.Future()  # Run forever
 
 
 def main():
