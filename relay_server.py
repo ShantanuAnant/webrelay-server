@@ -448,34 +448,32 @@ class RelayServer:
     async def health_handler(self, request):
         return web.json_response({"status": "ok", "service": "relay"})
     
-    async def start(self, host="0.0.0.0", port=None):
-        """Start the relay server"""
-        if port is None:
-            port = int(os.environ.get("PORT", 8080))
-        
-        logger.info(f"Starting relay server on {host}:{port}")
-        logger.info("Workshop should connect to: ws://YOUR_DOMAIN/workshop")
-        logger.info("Lab should connect to: ws://YOUR_DOMAIN/lab")
-        logger.info("Protocol demo clients should connect to: ws://YOUR_DOMAIN/protocol")
-
+    def build_app(self):
+        """Build and return the aiohttp web application."""
         app = web.Application()
         app.router.add_get("/", self.root_handler)
         app.router.add_get("/health", self.health_handler)
         app.router.add_get("/workshop", self.workshop_ws_handler)
         app.router.add_get("/lab", self.lab_ws_handler)
         app.router.add_get("/protocol", self.protocol_ws_handler)
-
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, host=host, port=port)
-        await site.start()
-
-        await asyncio.Future()  # Run forever
+        return app
 
 
 def main():
+    port = int(os.environ.get("PORT", 8080))
+    host = "0.0.0.0"
+
+    logger.info(f"Starting relay server on {host}:{port}")
+    logger.info("Workshop should connect to: ws://YOUR_DOMAIN/workshop")
+    logger.info("Lab should connect to:      ws://YOUR_DOMAIN/lab")
+    logger.info("Protocol clients connect to: ws://YOUR_DOMAIN/protocol")
+
     relay = RelayServer()
-    asyncio.run(relay.start())
+    app = relay.build_app()
+
+    # web.run_app() handles signals, graceful shutdown, and port binding
+    # correctly on managed platforms like Render.
+    web.run_app(app, host=host, port=port)
 
 
 if __name__ == "__main__":
